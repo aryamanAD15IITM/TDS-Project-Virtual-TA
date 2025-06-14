@@ -1,42 +1,67 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import List, Optional
-import base64
-import json
-import os
+from typing import Optional, List
+import base64, io
+from PIL import Image
+import pytesseract
 
-from .scraper import scrape_tds_course_page
+from .scraper import scrape_course_content, scrape_discourse
 
 app = FastAPI()
 
-with open("answers.json", "r") as f:
-    ANSWERS = json.load(f)
-
 class QuestionRequest(BaseModel):
     question: str
-    files: Optional[List[str]] = None
-
-@app.post("/")
-async def answer_question(payload: QuestionRequest):
-    q = payload.question.lower()
-    
-    # Check predefined answers
-    for k, v in ANSWERS.items():
-        if k.lower() in q:
-            return {"answer": v}
-
-    # Fallback to scraped content
-    try:
-        with open("content/tds_content.txt", "r", encoding="utf-8") as f:
-            content = f.read()
-        for line in content.split("\n"):
-            if q.split()[0] in line.lower():  # naive match
-                return {"answer": line.strip()}
-    except:
-        return {"answer": "No scraped content available. Please run /scrape."}
-
-    return {"answer": "Sorry, I could not find an answer."}
+    image: Optional[str] = None
 
 @app.get("/scrape/")
 def run_scraper():
-    return {"status": scrape_tds_course_page()}
+    c1 = scrape_course_content()
+    c2 = scrape_discourse()
+    return {"course": c1, "discourse": c2}
+
+def load_content():
+    texts = []
+    links = {}
+    try:
+        with open("content/course.txt", "r",encoding="utf-8") as f:
+            for l in f:
+                texts.append(l.strip())
+    except:
+        pass
+    try:
+        with open("content/discourse.txt","r",encoding="utf-8") as f:
+            for l in f:
+                if "\t" in l:
+                    title, url = l.strip().split("\t",1)
+                    texts.append(title)
+                    links[title] = url
+    except:
+        pass
+    return texts, links
+
+def extract_image_text(b64):
+    data = base64.b64decode(b64)
+    img = Image.open(io.BytesIO(data))
+    return pytesseract.image_to_string(img)
+
+@app.post("/")
+async def answer_question(req: QuestionRequest):
+    q = req.question
+    if req.image:
+        q += " " + extract_image_text(req.image)
+
+    texts, links_map = load_content()
+    answer = None
+    found_links = []
+
+    for text in texts:
+        if q.lower() in text.lower() or any(w in text.lower() for w in q.lower().split()):
+            answer = text
+            if text in links_map:
+                found_links.append({"url": links_map[text], "text": text})
+            break
+
+    if not answer:
+        answer = "Sorry, I could not find an answer based on the available course or discourse content."
+    return {"answer": answer, "links": found_links}
+
